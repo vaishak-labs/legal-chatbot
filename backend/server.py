@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import List
 import uuid
 from datetime import datetime, timezone
+from emergentintegrations.llm.chat import LlmChat, UserMessage
 
 
 ROOT_DIR = Path(__file__).parent
@@ -27,44 +28,114 @@ api_router = APIRouter(prefix="/api")
 
 
 # Define Models
-class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
+class ChatMessage(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
+    session_id: str
+    role: str  # "user" or "assistant"
+    message: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+class ChatRequest(BaseModel):
+    session_id: str
+    message: str
+
+class ChatResponse(BaseModel):
+    response: str
+    session_id: str
+
+# System message for the legal chatbot
+SYSTEM_MESSAGE = """You are a knowledgeable legal assistant specializing in consumer protection law. 
+You provide accurate, helpful information about consumer rights, warranties, refunds, fraud protection, 
+contract disputes, product liability, and all aspects of consumer protection legislation.
+
+Your role is to:
+- Answer questions clearly and comprehensively about consumer protection laws
+- Explain consumer rights in various situations
+- Provide guidance on how consumers can protect themselves
+- Explain legal concepts in simple, understandable terms
+- Cover topics including but not limited to: refunds, warranties, fraud, unfair practices, contract terms, 
+  product safety, data protection, online purchases, and dispute resolution
+
+Always provide thorough, accurate information while being clear that you're providing general legal information, 
+not personalized legal advice. Answer every question the user asks related to consumer protection."""
 
 # Add your routes to the router instead of directly to app
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"message": "Consumer Protection Legal Chatbot API"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
-    
-    # Convert to dict and serialize datetime to ISO string for MongoDB
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    
-    _ = await db.status_checks.insert_one(doc)
-    return status_obj
+@api_router.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    try:
+        # Store user message
+        user_msg = ChatMessage(
+            session_id=request.session_id,
+            role="user",
+            message=request.message
+        )
+        user_doc = user_msg.model_dump()
+        user_doc['timestamp'] = user_doc['timestamp'].isoformat()
+        await db.chat_messages.insert_one(user_doc)
+        
+        # Initialize chat with Gemini
+        chat = LlmChat(
+            api_key=os.environ['GEMINI_API_KEY'],
+            session_id=request.session_id,
+            system_message=SYSTEM_MESSAGE
+        ).with_model("gemini", "gemini-2.5-pro")
+        
+        # Create user message
+        user_message = UserMessage(text=request.message)
+        
+        # Get response from AI
+        ai_response = await chat.send_message(user_message)
+        
+        # Store assistant response
+        assistant_msg = ChatMessage(
+            session_id=request.session_id,
+            role="assistant",
+            message=ai_response
+        )
+        assistant_doc = assistant_msg.model_dump()
+        assistant_doc['timestamp'] = assistant_doc['timestamp'].isoformat()
+        await db.chat_messages.insert_one(assistant_doc)
+        
+        return ChatResponse(
+            response=ai_response,
+            session_id=request.session_id
+        )
+    except Exception as e:
+        logging.error(f"Chat error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    # Exclude MongoDB's _id field from the query results
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
-    
-    # Convert ISO string timestamps back to datetime objects
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
-    
-    return status_checks
+@api_router.get("/chat/history/{session_id}", response_model=List[ChatMessage])
+async def get_chat_history(session_id: str):
+    try:
+        messages = await db.chat_messages.find(
+            {"session_id": session_id},
+            {"_id": 0}
+        ).sort("timestamp", 1).to_list(1000)
+        
+        # Convert ISO string timestamps back to datetime objects
+        for msg in messages:
+            if isinstance(msg['timestamp'], str):
+                msg['timestamp'] = datetime.fromisoformat(msg['timestamp'])
+        
+        return messages
+    except Exception as e:
+        logging.error(f"Error fetching history: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error fetching history: {str(e)}")
+
+@api_router.delete("/chat/history/{session_id}")
+async def clear_chat_history(session_id: str):
+    try:
+        result = await db.chat_messages.delete_many({"session_id": session_id})
+        return {"deleted_count": result.deleted_count, "session_id": session_id}
+    except Exception as e:
+        logging.error(f"Error clearing history: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error clearing history: {str(e)}")
 
 # Include the router in the main app
 app.include_router(api_router)
