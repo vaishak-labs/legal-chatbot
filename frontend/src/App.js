@@ -66,7 +66,26 @@ function App() {
       setMessages(prev => [...prev, assistantMsg]);
     } catch (error) {
       console.error("Error sending message:", error);
-      toast.error("Failed to send message. Please try again.");
+      
+      // Provide user-friendly error messages based on error type
+      let errorMessage = "Failed to send message. Please try again.";
+      
+      if (error.response) {
+        if (error.response.status === 429) {
+          errorMessage = "API rate limit exceeded. Please wait a moment and try again.";
+        } else if (error.response.status === 500) {
+          const errorDetail = error.response.data?.detail || "";
+          if (errorDetail.includes("quota") || errorDetail.includes("rate limit")) {
+            errorMessage = "The AI service is currently experiencing high demand. Please wait a minute and try again.";
+          } else {
+            errorMessage = "An error occurred processing your request. Please try again.";
+          }
+        }
+      } else if (error.request) {
+        errorMessage = "Unable to reach the server. Please check your internet connection.";
+      }
+      
+      toast.error(errorMessage);
       // Remove the temporary user message on error
       setMessages(prev => prev.slice(0, -1));
     } finally {
